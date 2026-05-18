@@ -11,14 +11,20 @@ load_dotenv()
 
 app = Flask(__name__)
 
-ALERT_TTL_SECONDS = 600
+ALERT_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "600"))
+CACHE_BACKEND = os.getenv("CACHE_BACKEND", "valkey").lower()  # valkey ou redis
 
 
-def create_redis_client() -> Redis | None:
-    host = os.getenv("REDIS_HOST", "127.0.0.1")
-    port = int(os.getenv("REDIS_PORT", "6379"))
-    db = int(os.getenv("REDIS_DB", "0"))
-    password = os.getenv("REDIS_PASSWORD") or None
+def create_cache_client() -> Redis | None:
+    """Conecta ao Valkey/Redis para cache de alertas.
+    
+    Suporta tanto Valkey (fork do Redis) quanto Redis.
+    A API é idêntica, diferença está apenas na instalação.
+    """
+    host = os.getenv("VALKEY_HOST", os.getenv("REDIS_HOST", "127.0.0.1"))
+    port = int(os.getenv("VALKEY_PORT", os.getenv("REDIS_PORT", "6379")))
+    db = int(os.getenv("VALKEY_DB", os.getenv("REDIS_DB", "0")))
+    password = os.getenv("VALKEY_PASSWORD", os.getenv("REDIS_PASSWORD")) or None
 
     try:
         client = Redis(
@@ -31,20 +37,24 @@ def create_redis_client() -> Redis | None:
             socket_timeout=2,
         )
         client.ping()
+        backend_name = "Valkey" if CACHE_BACKEND == "valkey" else "Redis"
+        print(f"[INFO] {backend_name} conectado em {host}:{port}")
         return client
     except RedisError as exc:
-        print(f"[WARN] Redis indisponivel: {exc}")
+        backend_name = "Valkey" if CACHE_BACKEND == "valkey" else "Redis"
+        print(f"[WARN] {backend_name} indisponivel: {exc}")
         return None
 
 
-redis_client: Redis | None = None
+cache_client: Redis | None = None
 
 
-def get_redis_client() -> Redis | None:
-    global redis_client
-    if redis_client is None:
-        redis_client = create_redis_client()
-    return redis_client
+def get_cache_client() -> Redis | None:
+    """Obtém conexão com Valkey/Redis, reconectando se necessário."""
+    global cache_client
+    if cache_client is None:
+        cache_client = create_cache_client()
+    return cache_client
 
 
 def normalize_payload(payload: dict) -> dict:
@@ -62,15 +72,28 @@ def get_host_key(payload: dict, fallback_ip: str | None) -> str:
         value = payload.get(field)
         if isinstance(value, str) and value.strip():
             return value.strip()
+
+    # Fallback: extrai "Host: <nome>" da linha do campo message
+    message = payload.get("message", "")
+    if isinstance(message, str):
+        for line in message.splitlines():
+            line = line.strip()
+            if line.lower().startswith("host:"):
+                host_from_msg = line.split(":", 1)[1].strip()
+                if host_from_msg:
+                    return host_from_msg
+
     if fallback_ip:
         return fallback_ip
     return "host_desconhecido"
 
 
 def classify_alert_by_host(host_key: str) -> str:
-    client = get_redis_client()
+    """Classifica alerta como novo ou repetido (em 10 min) usando Valkey/Redis."""
+    client = get_cache_client()
     if client is None:
-        return "sem redis: alerta tratado como novo"
+        backend = "Valkey" if CACHE_BACKEND == "valkey" else "Redis"
+        return f"sem {backend.lower()}: alerta tratado como novo"
 
     cache_key = f"zbx:host_alert:{host_key}"
     now = datetime.now().isoformat(timespec="seconds")
@@ -83,9 +106,9 @@ def classify_alert_by_host(host_key: str) -> str:
             return "mesmo host (alerta nos ultimos 10 minutos)"
         return "novo host (sem alerta recente)"
     except RedisError as exc:
-        global redis_client
-        redis_client = None
-        return f"erro redis: {exc}"
+        global cache_client
+        cache_client = None
+        return f"erro cache: {exc}"
 
 
 @app.post("/webhook/zabbix")
