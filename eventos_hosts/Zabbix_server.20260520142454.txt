@@ -1,0 +1,14 @@
+Host: Zabbix server
+Inicio da janela: 2026-05-20 14:24:54
+
+--- EVENTO 2026-05-20 14:24:54 ---
+{
+  "message": "Host: Zabbix server\nProblem: CPU alta",
+  "subject": "Problema"
+}
+
+--- EVENTO 2026-05-20 14:25:03 ---
+{
+  "message": "Host: Zabbix server\nProblem: CPU alta",
+  "subject": "Problema"
+}
