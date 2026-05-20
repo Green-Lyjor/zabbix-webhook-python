@@ -23,6 +23,7 @@ EVENTS_DIR = Path(os.getenv("EVENTS_DIR", "eventos_hosts"))
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini")
 FINALIZER_INTERVAL_SECONDS = int(os.getenv("FINALIZER_INTERVAL_SECONDS", "20"))
+SUMMARY_MARKER = "================ RESUMO IA ================"
 
 EVENTS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -165,10 +166,32 @@ def append_event_to_file(file_path: Path, clean_payload: dict) -> None:
 def append_summary_to_file(file_path: Path, summary: str) -> None:
     finished_at = now_dt().strftime("%Y-%m-%d %H:%M:%S")
     with file_path.open("a", encoding="utf-8") as f:
-        f.write("\n================ RESUMO IA ================\n")
+        f.write(f"\n{SUMMARY_MARKER}\n")
         f.write(f"Finalizado em: {finished_at}\n")
         f.write(summary)
         f.write("\n")
+
+
+def has_summary(file_path: Path) -> bool:
+    if not file_path.exists():
+        return False
+    return SUMMARY_MARKER in file_path.read_text(encoding="utf-8")
+
+
+def acquire_finalize_lock(file_path: Path) -> bool:
+    lock_path = Path(str(file_path) + ".lock")
+    try:
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.close(fd)
+        return True
+    except FileExistsError:
+        return False
+
+
+def release_finalize_lock(file_path: Path) -> None:
+    lock_path = Path(str(file_path) + ".lock")
+    if lock_path.exists():
+        lock_path.unlink()
 
 
 def _session_key(host_key: str) -> str:
@@ -187,22 +210,34 @@ def finalize_session(host_key: str, session: dict) -> None:
     if not file_path.exists():
         return
 
-    events_text = file_path.read_text(encoding="utf-8")
-    summary = openrouter_summarize(host_key, events_text)
-    append_summary_to_file(file_path, summary)
+    if has_summary(file_path):
+        return
 
-    client = get_cache_client()
-    if client is not None:
-        try:
-            client.hset(_session_data_key(session["session_id"]), mapping={"finalized": "1"})
-            client.delete(_session_key(host_key))
-        except RedisError:
-            pass
-    else:
-        in_memory = in_memory_sessions.get(host_key)
-        if in_memory:
-            in_memory["finalized"] = "1"
-            in_memory_sessions.pop(host_key, None)
+    if not acquire_finalize_lock(file_path):
+        return
+
+    try:
+        if has_summary(file_path):
+            return
+
+        events_text = file_path.read_text(encoding="utf-8")
+        summary = openrouter_summarize(host_key, events_text)
+        append_summary_to_file(file_path, summary)
+
+        client = get_cache_client()
+        if client is not None:
+            try:
+                client.hset(_session_data_key(session["session_id"]), mapping={"finalized": "1"})
+                client.delete(_session_key(host_key))
+            except RedisError:
+                pass
+        else:
+            in_memory = in_memory_sessions.get(host_key)
+            if in_memory:
+                in_memory["finalized"] = "1"
+                in_memory_sessions.pop(host_key, None)
+    finally:
+        release_finalize_lock(file_path)
 
 
 def get_or_create_session(host_key: str) -> tuple[dict, bool]:
@@ -351,11 +386,14 @@ def zabbix_webhook() -> tuple:
 
 
 if __name__ == "__main__":
-    threading.Thread(target=finalize_due_sessions_loop, daemon=True).start()
+    debug_mode = os.getenv("APP_DEBUG", "true").lower() == "true"
+    should_start_finalizer = (not debug_mode) or (os.environ.get("WERKZEUG_RUN_MAIN") == "true")
+    if should_start_finalizer:
+        threading.Thread(target=finalize_due_sessions_loop, daemon=True).start()
 
     host = os.getenv("APP_HOST", "0.0.0.0")
     port = int(os.getenv("APP_PORT", "8000"))
 
     print(f"Iniciando servidor IA em http://{host}:{port}")
     print(f"Diretorio de eventos: {EVENTS_DIR.resolve()}")
-    app.run(host=host, port=port, debug=True)
+    app.run(host=host, port=port, debug=debug_mode)
