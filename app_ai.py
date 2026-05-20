@@ -178,6 +178,25 @@ def has_summary(file_path: Path) -> bool:
     return SUMMARY_MARKER in file_path.read_text(encoding="utf-8")
 
 
+def build_closed_file_path(file_path: Path) -> Path:
+    if file_path.stem.endswith("_fechado"):
+        return file_path
+    return file_path.with_name(f"{file_path.stem}_fechado{file_path.suffix}")
+
+
+def ensure_closed_filename(file_path: Path) -> Path:
+    target = build_closed_file_path(file_path)
+    if target == file_path:
+        return file_path
+
+    if target.exists():
+        stamp = datetime.now().strftime("%Y%m%d%H%M%S")
+        target = file_path.with_name(f"{file_path.stem}_fechado_{stamp}{file_path.suffix}")
+
+    file_path.rename(target)
+    return target
+
+
 def acquire_finalize_lock(file_path: Path) -> bool:
     lock_path = Path(str(file_path) + ".lock")
     try:
@@ -194,6 +213,26 @@ def release_finalize_lock(file_path: Path) -> None:
         lock_path.unlink()
 
 
+def mark_session_finalized(host_key: str, session: dict, final_file_path: Path) -> None:
+    client = get_cache_client()
+    if client is not None:
+        try:
+            client.hset(
+                _session_data_key(session["session_id"]),
+                mapping={"finalized": "1", "file_path": str(final_file_path)},
+            )
+            client.delete(_session_key(host_key))
+            return
+        except RedisError:
+            pass
+
+    in_memory = in_memory_sessions.get(host_key)
+    if in_memory:
+        in_memory["finalized"] = "1"
+        in_memory["file_path"] = str(final_file_path)
+        in_memory_sessions.pop(host_key, None)
+
+
 def _session_key(host_key: str) -> str:
     return f"zbx:ai:active:{host_key}"
 
@@ -206,38 +245,31 @@ def finalize_session(host_key: str, session: dict) -> None:
     if str(session.get("finalized", "0")) == "1":
         return
 
-    file_path = Path(session["file_path"])
-    if not file_path.exists():
+    original_file_path = Path(session["file_path"])
+    if not original_file_path.exists():
         return
 
-    if has_summary(file_path):
+    if has_summary(original_file_path):
+        final_file_path = ensure_closed_filename(original_file_path)
+        mark_session_finalized(host_key, session, final_file_path)
         return
 
-    if not acquire_finalize_lock(file_path):
+    if not acquire_finalize_lock(original_file_path):
         return
 
     try:
-        if has_summary(file_path):
+        if has_summary(original_file_path):
+            final_file_path = ensure_closed_filename(original_file_path)
+            mark_session_finalized(host_key, session, final_file_path)
             return
 
-        events_text = file_path.read_text(encoding="utf-8")
+        events_text = original_file_path.read_text(encoding="utf-8")
         summary = openrouter_summarize(host_key, events_text)
-        append_summary_to_file(file_path, summary)
-
-        client = get_cache_client()
-        if client is not None:
-            try:
-                client.hset(_session_data_key(session["session_id"]), mapping={"finalized": "1"})
-                client.delete(_session_key(host_key))
-            except RedisError:
-                pass
-        else:
-            in_memory = in_memory_sessions.get(host_key)
-            if in_memory:
-                in_memory["finalized"] = "1"
-                in_memory_sessions.pop(host_key, None)
+        append_summary_to_file(original_file_path, summary)
+        final_file_path = ensure_closed_filename(original_file_path)
+        mark_session_finalized(host_key, session, final_file_path)
     finally:
-        release_finalize_lock(file_path)
+        release_finalize_lock(original_file_path)
 
 
 def get_or_create_session(host_key: str) -> tuple[dict, bool]:
