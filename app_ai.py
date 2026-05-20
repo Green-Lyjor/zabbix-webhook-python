@@ -58,6 +58,9 @@ FINALIZER_INTERVAL_SECONDS = int(os.getenv("FINALIZER_INTERVAL_SECONDS", "20"))
 # Usado para detectar se o resumo ja foi escrito e evitar duplicacao
 SUMMARY_MARKER = "================ RESUMO IA ================"
 
+# Marcador do bloco de consumo de tokens gravado ao final do arquivo
+TOKENS_MARKER = "================ TOKENS CONSUMIDOS ================"
+
 # Cria a pasta de eventos se nao existir (parents=True cria diretorios pai)
 EVENTS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -190,7 +193,7 @@ def build_filename(host_key: str, started_at: datetime) -> Path:
 
 
 def openrouter_summarize(host_key: str, events_text: str) -> str:
-    """Envia os eventos da janela ao OpenRouter e retorna o resumo da IA.
+    """Envia os eventos da janela ao OpenRouter e retorna (resumo, usage).
 
     O prompt instrui o modelo a responder em pt-BR com:
     1) Resumo descritivo dos eventos
@@ -198,9 +201,12 @@ def openrouter_summarize(host_key: str, events_text: str) -> str:
     3) Acoes recomendadas em ordem de prioridade
 
     Usa a urllib padrao do Python para evitar dependencia de httpx/requests.
+
+    Retorna uma tupla (summary: str, usage: dict) onde usage contem
+    prompt_tokens, completion_tokens e total_tokens da resposta da API.
     """
     if not OPENROUTER_API_KEY:
-        return "[ERRO] OPENROUTER_API_KEY nao configurada."
+        return "[ERRO] OPENROUTER_API_KEY nao configurada.", {}
 
     # Prompt do usuario: contexto do host e todos os eventos da janela
     prompt = (
@@ -237,12 +243,14 @@ def openrouter_summarize(host_key: str, events_text: str) -> str:
             raw = resp.read().decode("utf-8")
             data = json.loads(raw)
             # Extrai o texto gerado pelo modelo da estrutura de resposta
-            return data["choices"][0]["message"]["content"].strip()
+            summary = data["choices"][0]["message"]["content"].strip()
+            usage = data.get("usage", {})
+            return summary, usage
     except error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="ignore")
-        return f"[ERRO] OpenRouter HTTP {exc.code}: {detail}"
+        return f"[ERRO] OpenRouter HTTP {exc.code}: {detail}", {}
     except Exception as exc:
-        return f"[ERRO] Falha ao chamar OpenRouter: {exc}"
+        return f"[ERRO] Falha ao chamar OpenRouter: {exc}", {}
 
 
 def append_event_to_file(file_path: Path, clean_payload: dict) -> None:
@@ -272,6 +280,57 @@ def append_summary_to_file(file_path: Path, summary: str) -> None:
         f.write(f"Finalizado em: {finished_at}\n")
         f.write(summary)
         f.write("\n")
+
+
+def accumulate_tokens(session_id: str, usage: dict) -> dict:
+    """Acumula os tokens consumidos pela chamada LLM no Redis da sessao.
+
+    Incrementa os contadores prompt_tokens, completion_tokens e total_tokens
+    na chave zbx:ai:tokens:<session_id>. Retorna o acumulado atual.
+    Silencioso em caso de erro de cache (nao critico).
+    """
+    if not usage:
+        return {}
+
+    key = f"zbx:ai:tokens:{session_id}"
+    client = get_cache_client()
+    if client is not None:
+        try:
+            pipe = client.pipeline()
+            for field in ("prompt_tokens", "completion_tokens", "total_tokens"):
+                if field in usage:
+                    pipe.hincrby(key, field, int(usage[field]))
+            pipe.expire(key, 86400)  # TTL de 24h para limpeza automatica
+            pipe.execute()
+            return client.hgetall(key)
+        except RedisError:
+            pass
+
+    return usage  # fallback: retorna apenas o uso atual se Redis falhar
+
+
+def append_tokens_to_file(file_path: Path, session_id: str, usage: dict) -> None:
+    """Grava o total acumulado de tokens consumidos no chamado ao final do arquivo."""
+    client = get_cache_client()
+    totals = {}
+    if client is not None:
+        try:
+            totals = client.hgetall(f"zbx:ai:tokens:{session_id}")
+        except RedisError:
+            pass
+
+    if not totals:
+        totals = usage  # fallback: usa apenas o uso da ultima chamada
+
+    if not totals:
+        return
+
+    with file_path.open("a", encoding="utf-8") as f:
+        f.write(f"\n{TOKENS_MARKER}\n")
+        f.write(f"Modelo:               {OPENROUTER_MODEL}\n")
+        f.write(f"Tokens de entrada:    {totals.get('prompt_tokens', 0)}\n")
+        f.write(f"Tokens de saida:      {totals.get('completion_tokens', 0)}\n")
+        f.write(f"Total de tokens:      {totals.get('total_tokens', 0)}\n")
 
 
 def has_summary(file_path: Path) -> bool:
@@ -431,10 +490,16 @@ def finalize_session(host_key: str, session: dict) -> None:
         events_text = original_file_path.read_text(encoding="utf-8")
 
         # Chama o OpenRouter e obtem o resumo em pt-BR
-        summary = openrouter_summarize(host_key, events_text)
+        summary, usage = openrouter_summarize(host_key, events_text)
+
+        # Acumula tokens no Redis e grava o total no arquivo
+        accumulate_tokens(session["session_id"], usage)
 
         # Adiciona o resumo ao final do arquivo
         append_summary_to_file(original_file_path, summary)
+
+        # Grava o bloco de tokens ao final do arquivo
+        append_tokens_to_file(original_file_path, session["session_id"], usage)
 
         # Renomeia para _fechado, sinalizando que nao aceita mais eventos
         final_file_path = ensure_closed_filename(original_file_path)
