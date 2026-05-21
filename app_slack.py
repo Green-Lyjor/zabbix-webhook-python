@@ -42,6 +42,8 @@ OPENROUTER_API_KEY         = os.getenv("OPENROUTER_API_KEY", "")
 OPENROUTER_MODEL           = os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini")
 FINALIZER_INTERVAL_SECONDS = int(os.getenv("FINALIZER_INTERVAL_SECONDS", "20"))
 SLACK_WEBHOOK_URL          = os.getenv("SLACK_WEBHOOK_URL", "")
+ZABBIX_URL                 = os.getenv("ZABBIX_URL", "").rstrip("/")
+ZABBIX_API_TOKEN           = os.getenv("ZABBIX_API_TOKEN", "")
 
 SUMMARY_MARKER = "================ RESUMO IA ================"
 
@@ -49,6 +51,7 @@ EVENTS_DIR.mkdir(parents=True, exist_ok=True)
 
 cache_client: Redis | None = None
 in_memory_sessions: dict[str, dict] = {}
+in_memory_event_ids: dict[str, set] = {}  # fallback quando Redis indisponivel
 
 
 # ------------------------------------------------------------------ utilidades
@@ -126,6 +129,111 @@ def get_cache_client() -> Redis | None:
     if cache_client is None:
         cache_client = create_cache_client()
     return cache_client
+
+
+# ------------------------------------------------------------------ eventos Zabbix
+
+def _event_ids_key(session_id: str) -> str:
+    """Chave do Set Redis que acumula os event_ids da sessao."""
+    return f"zbx:ai:eventids:{session_id}"
+
+
+def extract_event_id(payload: dict) -> str | None:
+    """Extrai o event_id Zabbix do payload recebido.
+
+    Tenta os campos mais comuns usados em configuracoes de webhook
+    Zabbix: event_id, eventid, EVENT.ID.
+    Retorna None se nenhum campo for encontrado ou o valor for zero.
+    """
+    for field in ("event_id", "eventid", "EVENT.ID", "event"):
+        value = payload.get(field)
+        if value and str(value).strip() not in ("", "0"):
+            return str(value).strip()
+    return None
+
+
+def collect_event_id(session_id: str, payload: dict) -> None:
+    """Armazena o event_id do payload no Set Redis da sessao.
+
+    Acumula todos os event_ids da janela de 10 min para que sejam
+    atualizados via event.acknowledge ao fechar o ticket.
+    """
+    event_id = extract_event_id(payload)
+    if not event_id:
+        return
+
+    client = get_cache_client()
+    if client is not None:
+        try:
+            key = _event_ids_key(session_id)
+            client.sadd(key, event_id)
+            client.expire(key, 86400)  # TTL 24h
+            return
+        except RedisError:
+            pass
+
+    # Fallback em memoria
+    if session_id not in in_memory_event_ids:
+        in_memory_event_ids[session_id] = set()
+    in_memory_event_ids[session_id].add(event_id)
+
+
+def zabbix_acknowledge_events(session_id: str, ticket_number: str) -> None:
+    """Chama event.acknowledge no Zabbix para todos os eventos do ticket.
+
+    Adiciona uma mensagem com o numero do ticket em cada evento Zabbix
+    envolvido na janela de 10 minutos. Silencioso em caso de falha.
+    """
+    if not ZABBIX_URL or not ZABBIX_API_TOKEN:
+        print("[WARN] ZABBIX_URL ou ZABBIX_API_TOKEN nao configurados. Atualizacao ignorada.")
+        return
+
+    event_ids: list[str] = []
+    client = get_cache_client()
+    if client is not None:
+        try:
+            event_ids = list(client.smembers(_event_ids_key(session_id)))
+        except RedisError:
+            pass
+
+    if not event_ids:
+        event_ids = list(in_memory_event_ids.get(session_id, set()))
+
+    if not event_ids:
+        print(f"[INFO] Nenhum event_id coletado para sessao {session_id}. Atualizacao ignorada.")
+        return
+
+    body = {
+        "jsonrpc": "2.0",
+        "method":  "event.acknowledge",
+        "params":  {
+            "eventids": event_ids,
+            "action":   4,  # 4 = adicionar mensagem
+            "message":  f"Ticket: {ticket_number}",
+        },
+        "auth": ZABBIX_API_TOKEN,
+        "id":   1,
+    }
+
+    req = request.Request(
+        f"{ZABBIX_URL}/api_jsonrpc.php",
+        data=json.dumps(body).encode("utf-8"),
+        headers={
+            "Content-Type":  "application/json",
+            "Authorization": f"Bearer {ZABBIX_API_TOKEN}",
+        },
+        method="POST",
+    )
+
+    try:
+        with request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            if "error" in data:
+                print(f"[WARN] Zabbix event.acknowledge erro: {data['error']}")
+            else:
+                print(f"[INFO] Zabbix: {len(event_ids)} evento(s) atualizado(s) com ticket={ticket_number}")
+    except Exception as exc:
+        print(f"[WARN] Falha ao chamar Zabbix API: {exc}")
 
 
 # ------------------------------------------------------------------ sessao / arquivo
@@ -485,6 +593,9 @@ def finalize_session(host_key: str, session: dict) -> None:
         final_file_path = ensure_closed_filename(original_file_path)
         mark_session_finalized(host_key, session, final_file_path)
 
+        # Atualiza os eventos Zabbix envolvidos com o numero do ticket
+        zabbix_acknowledge_events(session["session_id"], ticket_number)
+
         # Notifica o Slack apos gravar e renomear o arquivo
         send_slack_notification(host_key, ticket_number, summary, finished_at)
     finally:
@@ -541,6 +652,7 @@ def zabbix_webhook() -> tuple:
     ticket_number = session.get("ticket_number") or ticket_from_path(file_path)
 
     append_event_to_file(file_path, clean)
+    collect_event_id(session["session_id"], clean)
     touch_session(session)
 
     print("\n" + "=" * 60)
