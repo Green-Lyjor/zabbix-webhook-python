@@ -153,12 +153,13 @@ def extract_event_id(payload: dict) -> str | None:
 
 
 def collect_event_id(session_id: str, payload: dict) -> None:
-    """Armazena o event_id do payload no Set Redis da sessao.
-
-    Acumula todos os event_ids da janela de 10 min para que sejam
-    atualizados via event.acknowledge ao fechar o ticket.
-    """
+    """Armazena o event_id do payload no Set Redis da sessao."""
     event_id = extract_event_id(payload)
+
+    # Log sempre — ajuda a diagnosticar se o campo chega ou nao
+    raw_val = payload.get("event_id") or payload.get("eventid") or payload.get("EVENT.ID")
+    print(f"[DEBUG] collect_event_id: raw='{raw_val}' -> extraido='{event_id}'")
+
     if not event_id:
         return
 
@@ -168,6 +169,7 @@ def collect_event_id(session_id: str, payload: dict) -> None:
             key = _event_ids_key(session_id)
             client.sadd(key, event_id)
             client.expire(key, 86400)  # TTL 24h
+            print(f"[DEBUG] event_id {event_id} salvo no Redis (sessao {session_id})")
             return
         except RedisError:
             pass
@@ -176,14 +178,11 @@ def collect_event_id(session_id: str, payload: dict) -> None:
     if session_id not in in_memory_event_ids:
         in_memory_event_ids[session_id] = set()
     in_memory_event_ids[session_id].add(event_id)
+    print(f"[DEBUG] event_id {event_id} salvo em memoria (sessao {session_id})")
 
 
 def zabbix_acknowledge_events(session_id: str, ticket_number: str) -> None:
-    """Chama event.acknowledge no Zabbix para todos os eventos do ticket.
-
-    Adiciona uma mensagem com o numero do ticket em cada evento Zabbix
-    envolvido na janela de 10 minutos. Silencioso em caso de falha.
-    """
+    """Chama event.acknowledge no Zabbix para todos os eventos do ticket."""
     if not ZABBIX_URL or not ZABBIX_API_TOKEN:
         print("[WARN] ZABBIX_URL ou ZABBIX_API_TOKEN nao configurados. Atualizacao ignorada.")
         return
@@ -199,8 +198,10 @@ def zabbix_acknowledge_events(session_id: str, ticket_number: str) -> None:
     if not event_ids:
         event_ids = list(in_memory_event_ids.get(session_id, set()))
 
+    print(f"[DEBUG] zabbix_acknowledge: session={session_id} event_ids={event_ids}")
+
     if not event_ids:
-        print(f"[INFO] Nenhum event_id coletado para sessao {session_id}. Atualizacao ignorada.")
+        print(f"[WARN] Nenhum event_id coletado para sessao {session_id}. Atualizacao ignorada.")
         return
 
     body = {
@@ -215,8 +216,12 @@ def zabbix_acknowledge_events(session_id: str, ticket_number: str) -> None:
         "id":   1,
     }
 
+    api_url = f"{ZABBIX_URL}/api_jsonrpc.php"
+    print(f"[DEBUG] Chamando Zabbix API: {api_url}")
+    print(f"[DEBUG] Payload: {json.dumps(body)}")
+
     req = request.Request(
-        f"{ZABBIX_URL}/api_jsonrpc.php",
+        api_url,
         data=json.dumps(body).encode("utf-8"),
         headers={
             "Content-Type":  "application/json",
@@ -227,11 +232,16 @@ def zabbix_acknowledge_events(session_id: str, ticket_number: str) -> None:
 
     try:
         with request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
+            raw = resp.read().decode("utf-8")
+            print(f"[DEBUG] Zabbix resposta: {raw}")
+            data = json.loads(raw)
             if "error" in data:
                 print(f"[WARN] Zabbix event.acknowledge erro: {data['error']}")
             else:
                 print(f"[INFO] Zabbix: {len(event_ids)} evento(s) atualizado(s) com ticket={ticket_number}")
+    except error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="ignore")
+        print(f"[WARN] Zabbix API HTTP {exc.code}: {detail}")
     except Exception as exc:
         print(f"[WARN] Falha ao chamar Zabbix API: {exc}")
 
